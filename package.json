@@ -1,0 +1,23 @@
+{
+  "name": "web-pos-system",
+  "version": "1.0.0",
+  "description": "A modern web-based Point of Sale system with inventory management, sales tracking, and reporting",
+  "main": "index.js",
+  "scripts": {
+    "test": "npm --prefix server run test",
+    "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "build": "npm --prefix server run build && npm --prefix client run build",
+    "lint": "npm --prefix client run lint"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://localhost:26831/hjkim115/web-pos-system"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  },
+  "private": true
+}
