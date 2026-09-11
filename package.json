@@ -19,5 +19,5 @@
   "devDependencies": {
     "concurrently": "^10.0.5"
   },
-  "private": "true"
+  "private": true
 }

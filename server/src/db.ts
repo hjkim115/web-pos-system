@@ -18,17 +18,34 @@ export const db = new LowSync<DatabaseSchema>(adapter, {
 
 export const now = () => new Date().toISOString()
 
-const defaultAdmin: User = {
-  id: randomUUID(),
-  username: 'admin',
-  passwordHash: bcrypt.hashSync('admin123', 10),
-  role: 'ADMIN',
-  createdAt: now(),
+const defaultDatabaseState = (): DatabaseSchema => ({
+  users: [],
+  products: [],
+  sales: [],
+  inventoryHistory: [],
+  activityLogs: [],
+})
+
+const isDevelopment = process.env.NODE_ENV === 'development'
+const defaultAdminPassword = process.env.DEFAULT_ADMIN_PASSWORD
+
+if (!defaultAdminPassword && !isDevelopment) {
+  throw new Error('DEFAULT_ADMIN_PASSWORD must be set when NODE_ENV is not development.')
 }
 
-db.read()
-if (!db.data.users.length) {
-  db.data.users.push(defaultAdmin)
+export const initializeDatabase = async () => {
+  db.read()
+  db.data ||= defaultDatabaseState()
+  if (!db.data.users.length) {
+    const defaultAdmin: User = {
+      id: randomUUID(),
+      username: 'admin',
+      passwordHash: await bcrypt.hash(defaultAdminPassword ?? 'admin123', 10),
+      role: 'ADMIN',
+      createdAt: now(),
+    }
+    db.data.users.push(defaultAdmin)
+  }
   db.write()
 }
 

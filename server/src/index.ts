@@ -1,12 +1,13 @@
 import bcrypt from 'bcryptjs'
 import cors from 'cors'
 import express from 'express'
+import rateLimit from 'express-rate-limit'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
-import { db, logActivity, now } from './db.js'
-import { signToken, verifyToken } from './auth.js'
+import { db, initializeDatabase, logActivity, now } from './db.js'
+import { signToken } from './auth.js'
 import { authenticate, authorize, type AuthRequest } from './middleware.js'
-import type { CartItem, InventoryHistoryEntry, PaymentMethod, Product, User, UserRole } from './types.js'
+import type { CartItem, InventoryHistoryEntry, PaymentMethod, Product, User } from './types.js'
 
 const app = express()
 const port = Number(process.env.PORT ?? 4000)
@@ -14,8 +15,28 @@ const taxRate = 0.1
 
 app.use(cors())
 app.use(express.json())
+app.use(
+  '/api/auth/login',
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 25,
+    standardHeaders: true,
+    legacyHeaders: false,
+  }),
+)
+app.use(
+  '/api',
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 400,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.path === '/auth/login',
+  }),
+)
 
 const streamClients = new Set<express.Response>()
+const streamConnectionsByUser = new Map<string, number>()
 const broadcast = (event: string, payload: unknown) => {
   const message = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`
   for (const client of streamClients) {
@@ -27,23 +48,11 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: now() })
 })
 
-app.get('/api/stream', (req, res) => {
-  const headerToken = typeof req.headers['x-auth-token'] === 'string' ? req.headers['x-auth-token'] : undefined
-  const authHeader = req.headers.authorization
-  const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined
-  const queryToken = typeof req.query.token === 'string' ? req.query.token : undefined
-  const token = headerToken ?? bearerToken ?? queryToken
-  if (!token) {
-    return res.status(401).json({ message: 'Authentication required.' })
-  }
-
-  try {
-    const payload = verifyToken(token)
-    if (!db.data.users.some((user) => user.id === payload.userId)) {
-      return res.status(401).json({ message: 'User account not found.' })
-    }
-  } catch {
-    return res.status(401).json({ message: 'Invalid token.' })
+app.get('/api/stream', authenticate, (req: AuthRequest, res) => {
+  const userId = req.auth!.userId
+  const existingConnections = streamConnectionsByUser.get(userId) ?? 0
+  if (existingConnections >= 2) {
+    return res.status(429).json({ message: 'Too many open realtime connections for this user.' })
   }
 
   res.setHeader('Content-Type', 'text/event-stream')
@@ -52,9 +61,16 @@ app.get('/api/stream', (req, res) => {
   res.flushHeaders()
   res.write(`event: connected\ndata: ${JSON.stringify({ timestamp: now() })}\n\n`)
   streamClients.add(res)
+  streamConnectionsByUser.set(userId, existingConnections + 1)
 
   req.on('close', () => {
     streamClients.delete(res)
+    const updatedCount = (streamConnectionsByUser.get(userId) ?? 1) - 1
+    if (updatedCount <= 0) {
+      streamConnectionsByUser.delete(userId)
+    } else {
+      streamConnectionsByUser.set(userId, updatedCount)
+    }
   })
 })
 
@@ -70,19 +86,24 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const user = db.data.users.find((item) => item.username === parsed.data.username)
-  if (!user || !bcrypt.compareSync(parsed.data.password, user.passwordHash)) {
-    return res.status(401).json({ message: 'Invalid username or password.' })
-  }
+  return bcrypt
+    .compare(parsed.data.password, user?.passwordHash ?? '')
+    .then((isValid) => {
+      if (!user || !isValid) {
+        return res.status(401).json({ message: 'Invalid username or password.' })
+      }
 
-  const token = signToken(user)
-  return res.json({
-    token,
-    user: {
-      id: user.id,
-      username: user.username,
-      role: user.role,
-    },
-  })
+      const token = signToken(user)
+      return res.json({
+        token,
+        user: {
+          id: user.id,
+          username: user.username,
+          role: user.role,
+        },
+      })
+    })
+    .catch(() => res.status(500).json({ message: 'Unable to process login.' }))
 })
 
 app.get('/api/auth/me', authenticate, (req: AuthRequest, res) => {
@@ -105,7 +126,7 @@ app.get('/api/users', authenticate, authorize('ADMIN', 'MANAGER'), (_req, res) =
   return res.json(users)
 })
 
-app.post('/api/users', authenticate, authorize('ADMIN'), (req: AuthRequest, res) => {
+app.post('/api/users', authenticate, authorize('ADMIN'), async (req: AuthRequest, res) => {
   const parsed = userSchema.safeParse(req.body)
   if (!parsed.success || !parsed.data.password) {
     return res.status(400).json({ message: 'Invalid user payload. Password is required.' })
@@ -115,10 +136,11 @@ app.post('/api/users', authenticate, authorize('ADMIN'), (req: AuthRequest, res)
     return res.status(409).json({ message: 'Username already exists.' })
   }
 
+  const passwordHash = await bcrypt.hash(parsed.data.password, 10)
   const user: User = {
     id: randomUUID(),
     username: parsed.data.username,
-    passwordHash: bcrypt.hashSync(parsed.data.password, 10),
+    passwordHash,
     role: parsed.data.role,
     createdAt: now(),
   }
@@ -131,7 +153,7 @@ app.post('/api/users', authenticate, authorize('ADMIN'), (req: AuthRequest, res)
   return res.status(201).json({ id: user.id, username: user.username, role: user.role, createdAt: user.createdAt })
 })
 
-app.put('/api/users/:id', authenticate, authorize('ADMIN'), (req: AuthRequest, res) => {
+app.put('/api/users/:id', authenticate, authorize('ADMIN'), async (req: AuthRequest, res) => {
   const parsed = userSchema.safeParse(req.body)
   if (!parsed.success) {
     return res.status(400).json({ message: 'Invalid user payload.' })
@@ -149,7 +171,7 @@ app.put('/api/users/:id', authenticate, authorize('ADMIN'), (req: AuthRequest, r
   user.username = parsed.data.username
   user.role = parsed.data.role
   if (parsed.data.password) {
-    user.passwordHash = bcrypt.hashSync(parsed.data.password, 10)
+    user.passwordHash = await bcrypt.hash(parsed.data.password, 10)
   }
 
   db.write()
@@ -352,14 +374,20 @@ app.post('/api/sales/checkout', authenticate, (req: AuthRequest, res) => {
     return res.status(400).json({ message: 'Invalid checkout payload.' })
   }
 
-  const items: CartItem[] = []
-
+  const quantityByProduct = new Map<string, number>()
   for (const item of parsed.data.items) {
-    const product = db.data.products.find((productItem) => productItem.id === item.productId)
+    quantityByProduct.set(item.productId, (quantityByProduct.get(item.productId) ?? 0) + item.quantity)
+  }
+
+  const items: CartItem[] = []
+  const stockDeductionQueue: Array<{ product: Product; quantity: number }> = []
+
+  for (const [productId, quantity] of quantityByProduct.entries()) {
+    const product = db.data.products.find((productItem) => productItem.id === productId)
     if (!product) {
-      return res.status(404).json({ message: `Product ${item.productId} not found.` })
+      return res.status(404).json({ message: `Product ${productId} not found.` })
     }
-    if (product.stock < item.quantity) {
+    if (product.stock < quantity) {
       return res.status(400).json({ message: `Insufficient stock for ${product.name}.` })
     }
     items.push({
@@ -367,9 +395,10 @@ app.post('/api/sales/checkout', authenticate, (req: AuthRequest, res) => {
       name: product.name,
       sku: product.sku,
       price: product.price,
-      quantity: item.quantity,
-      subtotal: Number((product.price * item.quantity).toFixed(2)),
+      quantity,
+      subtotal: Number((product.price * quantity).toFixed(2)),
     })
+    stockDeductionQueue.push({ product, quantity })
   }
 
   const subtotal = Number(items.reduce((sum, item) => sum + item.subtotal, 0).toFixed(2))
@@ -378,25 +407,20 @@ app.post('/api/sales/checkout', authenticate, (req: AuthRequest, res) => {
   const paymentMethod: PaymentMethod = parsed.data.paymentMethod
   const cashReceived = paymentMethod === 'CASH' ? parsed.data.cashReceived : undefined
 
-  if (paymentMethod === 'CASH' && (!cashReceived || cashReceived < total)) {
+  if (paymentMethod === 'CASH' && (cashReceived === undefined || cashReceived < total)) {
     return res.status(400).json({ message: 'Cash received must be at least the total amount.' })
   }
 
-  for (const item of items) {
-    const product = db.data.products.find((productItem) => productItem.id === item.productId)
-    if (!product) {
-      continue
-    }
-
+  for (const { product, quantity } of stockDeductionQueue) {
     const previousStock = product.stock
-    product.stock -= item.quantity
+    product.stock -= quantity
     product.updatedAt = now()
 
     db.data.inventoryHistory.unshift({
       id: randomUUID(),
       productId: product.id,
       type: 'SALE',
-      quantity: -item.quantity,
+      quantity: -quantity,
       previousStock,
       newStock: product.stock,
       note: 'Sold via checkout',
@@ -409,7 +433,7 @@ app.post('/api/sales/checkout', authenticate, (req: AuthRequest, res) => {
   const saleId = randomUUID()
   const sale = {
     id: saleId,
-    receiptNumber: `R-${Date.now()}`,
+    receiptNumber: `R-${randomUUID().split('-')[0]}-${Date.now()}`,
     items,
     subtotal,
     tax,
@@ -461,8 +485,10 @@ const getRangeStart = (range: 'daily' | 'weekly' | 'monthly') => {
     rangeDate.setHours(0, 0, 0, 0)
   } else if (range === 'weekly') {
     rangeDate.setDate(currentDate.getDate() - 7)
+    rangeDate.setHours(0, 0, 0, 0)
   } else {
     rangeDate.setMonth(currentDate.getMonth() - 1)
+    rangeDate.setHours(0, 0, 0, 0)
   }
   return rangeDate
 }
@@ -546,8 +572,15 @@ app.get('/api/reports/inventory', authenticate, (_req, res) => {
 })
 
 app.get('/api/dashboard/overview', authenticate, (_req, res) => {
-  const todayDate = new Date().toISOString().slice(0, 10)
-  const todaySales = db.data.sales.filter((sale) => sale.createdAt.startsWith(todayDate))
+  const startOfToday = new Date()
+  startOfToday.setHours(0, 0, 0, 0)
+  const endOfToday = new Date(startOfToday)
+  endOfToday.setDate(endOfToday.getDate() + 1)
+
+  const todaySales = db.data.sales.filter((sale) => {
+    const saleDate = new Date(sale.createdAt)
+    return saleDate >= startOfToday && saleDate < endOfToday
+  })
   const lowStockProducts = db.data.products.filter((product) => product.stock <= product.lowStockThreshold)
 
   return res.json({
@@ -570,6 +603,14 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
   return res.status(500).json({ message: 'Internal server error.' })
 })
 
-app.listen(port, () => {
-  console.log(`POS backend server running on http://localhost:${port}`)
+const startServer = async () => {
+  await initializeDatabase()
+  app.listen(port, () => {
+    console.log(`POS backend server running on http://localhost:${port}`)
+  })
+}
+
+startServer().catch((error) => {
+  console.error('Failed to start server:', error)
+  process.exit(1)
 })

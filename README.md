@@ -33,7 +33,7 @@ npm --prefix client install
 ### 2) Run in development
 
 ```bash
-npm run dev
+NODE_ENV=development npm run dev
 ```
 
 - Frontend: `http://localhost:5173`
@@ -45,12 +45,14 @@ npm run dev
 npm run build
 ```
 
-## Default Login
+## Authentication Setup
 
-The server seeds a default admin account on first run:
-
-- **Username**: `admin`
-- **Password**: `admin123`
+- In `NODE_ENV=development`, the server seeds a default admin account:
+  - **Username**: `admin`
+  - **Password**: `admin123` (or `DEFAULT_ADMIN_PASSWORD` if provided)
+- In non-development environments, you **must** set:
+  - `JWT_SECRET`
+  - `DEFAULT_ADMIN_PASSWORD`
 
 ## Role Permissions
 
@@ -73,4 +75,4 @@ The server seeds a default admin account on first run:
 ## Notes
 
 - Data is persisted to `server/data/db.json`.
-- Set `JWT_SECRET` in your environment for production deployments.
+- Set `JWT_SECRET` and `DEFAULT_ADMIN_PASSWORD` in non-development deployments.

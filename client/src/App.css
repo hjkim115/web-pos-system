@@ -143,7 +143,19 @@ td {
 }
 
 .message {
+  border: 1px solid transparent;
+}
+
+.message.success {
   color: #047857;
+  background: #ecfdf5;
+  border-color: #6ee7b7;
+}
+
+.message.error {
+  color: #b91c1c;
+  background: #fef2f2;
+  border-color: #fca5a5;
 }
 
 @media (max-width: 960px) {

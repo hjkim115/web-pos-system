@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 type Role = 'ADMIN' | 'MANAGER' | 'CASHIER'
@@ -125,7 +125,7 @@ function App() {
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('CASH')
   const [cashReceived, setCashReceived] = useState(0)
 
-  const apiFetch = async <T,>(path: string, options: RequestInit = {}) => {
+  const apiFetch = useCallback(async <T,>(path: string, options: RequestInit = {}) => {
     const response = await fetch(`${apiBase}${path}`, {
       ...options,
       headers: {
@@ -145,9 +145,9 @@ function App() {
     }
 
     return (await response.json()) as T
-  }
+  }, [token])
 
-  const loadCoreData = async () => {
+  const loadCoreData = useCallback(async () => {
     if (!token) {
       return
     }
@@ -165,9 +165,9 @@ function App() {
     setInventoryHistory(loadedHistory)
     setTransactions(loadedTransactions)
     setDashboard(loadedDashboard)
-  }
+  }, [apiFetch, token])
 
-  const loadReports = async () => {
+  const loadReports = useCallback(async () => {
     if (!token) {
       return
     }
@@ -183,9 +183,9 @@ function App() {
     setTopProducts(top)
     setRevenuePoints(revenue)
     setInventoryReport(inventory)
-  }
+  }, [apiFetch, token])
 
-  const loadUsers = async () => {
+  const loadUsers = useCallback(async () => {
     if (!token || !user || (user.role !== 'ADMIN' && user.role !== 'MANAGER')) {
       setUsers([])
       return
@@ -193,11 +193,11 @@ function App() {
 
     const loadedUsers = await apiFetch<User[]>('/users')
     setUsers(loadedUsers)
-  }
+  }, [apiFetch, token, user])
 
-  const refreshEverything = async () => {
+  const refreshEverything = useCallback(async () => {
     await Promise.all([loadCoreData(), loadReports(), loadUsers()])
-  }
+  }, [loadCoreData, loadReports, loadUsers])
 
   useEffect(() => {
     if (!token) {
@@ -208,25 +208,77 @@ function App() {
       const detail = error instanceof Error ? error.message : 'Failed to refresh data'
       setMessage(detail)
     })
-  }, [token])
+  }, [refreshEverything, token])
 
   useEffect(() => {
     if (!token) {
       return
     }
 
-    const eventSource = new EventSource(`${apiBase}/stream?token=${encodeURIComponent(token)}`)
-    eventSource.onmessage = () => {
-      refreshEverything().catch(() => undefined)
-    }
-    eventSource.onerror = () => {
-      eventSource.close()
+    let isCancelled = false
+    let fallbackInterval: number | null = null
+    const abortController = new AbortController()
+    let streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null
+
+    const startFallbackPolling = () => {
+      if (fallbackInterval !== null) {
+        return
+      }
+      fallbackInterval = window.setInterval(() => {
+        refreshEverything().catch(() => undefined)
+      }, 10000)
     }
 
-    return () => {
-      eventSource.close()
+    const connectStream = async () => {
+      try {
+        const response = await fetch(`${apiBase}/stream`, {
+          headers: { 'x-auth-token': token },
+          signal: abortController.signal,
+        })
+        if (!response.ok || !response.body) {
+          startFallbackPolling()
+          return
+        }
+
+        const decoder = new TextDecoder()
+        const reader = response.body.getReader()
+        streamReader = reader
+        let buffer = ''
+
+        while (!isCancelled) {
+          const { value, done } = await reader.read()
+          if (done) {
+            startFallbackPolling()
+            break
+          }
+          buffer += decoder.decode(value, { stream: true })
+
+          let eventSeparator = buffer.indexOf('\n\n')
+          while (eventSeparator >= 0) {
+            const eventBlock = buffer.slice(0, eventSeparator)
+            if (!eventBlock.includes('event: connected')) {
+              refreshEverything().catch(() => undefined)
+            }
+            buffer = buffer.slice(eventSeparator + 2)
+            eventSeparator = buffer.indexOf('\n\n')
+          }
+        }
+      } catch {
+        startFallbackPolling()
+      }
     }
-  }, [token, user?.role])
+
+    connectStream().catch(() => startFallbackPolling())
+
+    return () => {
+      isCancelled = true
+      abortController.abort()
+      streamReader?.cancel().catch(() => undefined)
+      if (fallbackInterval !== null) {
+        window.clearInterval(fallbackInterval)
+      }
+    }
+  }, [refreshEverything, token, user?.role])
 
   const productById = useMemo(() => new Map(products.map((product) => [product.id, product])), [products])
   const cartItems = useMemo(
@@ -255,7 +307,9 @@ function App() {
   const checkoutTotal = Number((checkoutSubtotal + checkoutTax).toFixed(2))
 
   const canManageProducts = user?.role === 'ADMIN' || user?.role === 'MANAGER'
+  const canViewUsers = user?.role === 'ADMIN' || user?.role === 'MANAGER'
   const canManageUsers = user?.role === 'ADMIN'
+  const isErrorMessage = /failed|unable|invalid|insufficient|required|not found|too many/i.test(message)
 
   const handleLogin = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -273,6 +327,7 @@ function App() {
 
       setToken(data.token)
       setUser(data.user)
+      setActiveTab('DASHBOARD')
       setMessage('Logged in successfully.')
     } catch (error: unknown) {
       const detail = error instanceof Error ? error.message : 'Login failed.'
@@ -388,8 +443,9 @@ function App() {
       if (response.printableReceipt) {
         const printWindow = window.open('', '_blank', 'width=420,height=640')
         if (printWindow) {
-          printWindow.document.write(`<pre>${response.printableReceipt}</pre>`)
-          printWindow.document.close()
+          const receiptNode = printWindow.document.createElement('pre')
+          receiptNode.textContent = response.printableReceipt
+          printWindow.document.body.appendChild(receiptNode)
           printWindow.focus()
           printWindow.print()
         }
@@ -405,14 +461,32 @@ function App() {
     }
   }
 
-  const visibleTabs = canManageUsers ? tabs : tabs.filter((tab) => tab !== 'USERS')
+  const clearSessionData = () => {
+    setProducts([])
+    setUsers([])
+    setLowStockProducts([])
+    setInventoryHistory([])
+    setTransactions([])
+    setDashboard(null)
+    setSalesReport(null)
+    setTopProducts([])
+    setRevenuePoints([])
+    setInventoryReport(null)
+    setProductForm({ id: '', name: '', category: '', sku: '', price: 0, stock: 0, lowStockThreshold: 3 })
+    setInventoryAdjustment({ productId: '', quantity: 0, note: '' })
+    setUserForm({ id: '', username: '', password: '', role: 'CASHIER' })
+    setCart({})
+    setPaymentMethod('CASH')
+    setCashReceived(0)
+  }
+
+  const visibleTabs = canViewUsers ? tabs : tabs.filter((tab) => tab !== 'USERS')
 
   if (!token || !user) {
     return (
       <main className="login-page">
         <form className="card form" onSubmit={handleLogin}>
           <h1>Web POS System</h1>
-          <p>Default admin credentials: admin / admin123</p>
           <label>
             Username
             <input value={username} onChange={(event) => setUsername(event.target.value)} required />
@@ -427,7 +501,7 @@ function App() {
             />
           </label>
           <button type="submit">Sign In</button>
-          {message && <p className="message">{message}</p>}
+          {message && <p className={`message ${isErrorMessage ? 'error' : 'success'}`}>{message}</p>}
         </form>
       </main>
     )
@@ -447,6 +521,8 @@ function App() {
           onClick={() => {
             setToken('')
             setUser(null)
+            clearSessionData()
+            setActiveTab('DASHBOARD')
             setMessage('Signed out.')
           }}
         >
@@ -467,7 +543,7 @@ function App() {
         ))}
       </nav>
 
-      {message && <p className="message card">{message}</p>}
+      {message && <p className={`message card ${isErrorMessage ? 'error' : 'success'}`}>{message}</p>}
 
       {activeTab === 'DASHBOARD' && dashboard && (
         <section className="grid">
@@ -903,49 +979,51 @@ function App() {
         </section>
       )}
 
-      {activeTab === 'USERS' && canManageUsers && (
+      {activeTab === 'USERS' && canViewUsers && (
         <section className="grid">
-          <article className="card">
-            <h2>{userForm.id ? 'Edit User' : 'Create User'}</h2>
-            <form className="form" onSubmit={saveUser}>
-              <label>
-                Username
-                <input
-                  value={userForm.username}
-                  onChange={(event) => setUserForm((current) => ({ ...current, username: event.target.value }))}
-                  required
-                />
-              </label>
-              <label>
-                Password
-                <input
-                  type="password"
-                  value={userForm.password}
-                  onChange={(event) => setUserForm((current) => ({ ...current, password: event.target.value }))}
-                  placeholder={userForm.id ? 'Leave blank to keep current password' : ''}
-                />
-              </label>
-              <label>
-                Role
-                <select
-                  value={userForm.role}
-                  onChange={(event) => setUserForm((current) => ({ ...current, role: event.target.value as Role }))}
-                >
-                  <option value="ADMIN">Admin</option>
-                  <option value="MANAGER">Manager</option>
-                  <option value="CASHIER">Cashier</option>
-                </select>
-              </label>
-              <div className="button-row">
-                <button type="submit">Save User</button>
-                {userForm.id && (
-                  <button type="button" onClick={() => setUserForm({ id: '', username: '', password: '', role: 'CASHIER' })}>
-                    Cancel Edit
-                  </button>
-                )}
-              </div>
-            </form>
-          </article>
+          {canManageUsers && (
+            <article className="card">
+              <h2>{userForm.id ? 'Edit User' : 'Create User'}</h2>
+              <form className="form" onSubmit={saveUser}>
+                <label>
+                  Username
+                  <input
+                    value={userForm.username}
+                    onChange={(event) => setUserForm((current) => ({ ...current, username: event.target.value }))}
+                    required
+                  />
+                </label>
+                <label>
+                  Password
+                  <input
+                    type="password"
+                    value={userForm.password}
+                    onChange={(event) => setUserForm((current) => ({ ...current, password: event.target.value }))}
+                    placeholder={userForm.id ? 'Leave blank to keep current password' : ''}
+                  />
+                </label>
+                <label>
+                  Role
+                  <select
+                    value={userForm.role}
+                    onChange={(event) => setUserForm((current) => ({ ...current, role: event.target.value as Role }))}
+                  >
+                    <option value="ADMIN">Admin</option>
+                    <option value="MANAGER">Manager</option>
+                    <option value="CASHIER">Cashier</option>
+                  </select>
+                </label>
+                <div className="button-row">
+                  <button type="submit">Save User</button>
+                  {userForm.id && (
+                    <button type="button" onClick={() => setUserForm({ id: '', username: '', password: '', role: 'CASHIER' })}>
+                      Cancel Edit
+                    </button>
+                  )}
+                </div>
+              </form>
+            </article>
+          )}
           <article className="card span-two">
             <h2>Employee Accounts</h2>
             <table>
@@ -962,19 +1040,23 @@ function App() {
                     <td>{existingUser.username}</td>
                     <td>{existingUser.role}</td>
                     <td>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setUserForm({
-                            id: existingUser.id,
-                            username: existingUser.username,
-                            password: '',
-                            role: existingUser.role,
-                          })
-                        }
-                      >
-                        Edit
-                      </button>
+                      {canManageUsers ? (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setUserForm({
+                              id: existingUser.id,
+                              username: existingUser.username,
+                              password: '',
+                              role: existingUser.role,
+                            })
+                          }
+                        >
+                          Edit
+                        </button>
+                      ) : (
+                        'View only'
+                      )}
                     </td>
                   </tr>
                 ))}

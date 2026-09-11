@@ -1,7 +1,13 @@
 import jwt from 'jsonwebtoken'
 import type { User, UserRole } from './types.js'
 
-const JWT_SECRET = process.env.JWT_SECRET ?? 'development-pos-secret'
+const isDevelopment = process.env.NODE_ENV === 'development'
+const jwtSecretFromEnv = process.env.JWT_SECRET
+if (!jwtSecretFromEnv && !isDevelopment) {
+  throw new Error('JWT_SECRET must be set when NODE_ENV is not development.')
+}
+
+const JWT_SECRET = jwtSecretFromEnv ?? 'development-only-jwt-secret'
 const JWT_EXPIRES_IN = '8h'
 
 export interface AuthPayload {
